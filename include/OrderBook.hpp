@@ -7,11 +7,13 @@
 #include <list>
 #include <unordered_map>
 #include <stdint.h>
+#include <memory>
+#include <functional>
 
-// Using fixed-point arithmetic for price to avoid double precision issues
-// 100.50 becomes 10050 (scaled by 100)
+// --- Types & Constants ---
 typedef int64_t Price;
 typedef uint32_t Quantity;
+const Price SCALE = 10000; // 4 decimal places precision
 
 enum class Side { BUY, SELL };
 
@@ -22,25 +24,76 @@ struct Order {
     Side side;
 };
 
+struct TradeEvent {
+    uint64_t buyOrderId;
+    uint64_t sellOrderId;
+    Price price;
+    Quantity quantity;
+};
+
+struct BBO {
+    Price bestBid = 0;
+    Price bestAsk = 0;
+    Quantity bidQty = 0;
+    Quantity askQty = 0;
+};
+
+// --- Memory Pool (Simplified for HFT) ---
+template<typename T, size_t BlockSize = 1024>
+class ObjectPool {
+private:
+    std::vector<std::unique_ptr<T[]>> blocks;
+    std::vector<T*> freeList;
+
+public:
+    T* allocate() {
+        if (freeList.empty()) {
+            blocks.push_back(std::make_unique<T[]>(BlockSize));
+            for (size_t i = 0; i < BlockSize; ++i) {
+                freeList.push_back(&blocks.back()[i]);
+            }
+        }
+        T* obj = freeList.back();
+        freeList.pop_back();
+        return obj;
+    }
+
+    void deallocate(T* obj) {
+        freeList.push_back(obj);
+    }
+};
+
 class OrderBook {
 private:
-    // Prices mapped to lists of orders (FIFO)
-    std::map<Price, std::list<Order>, std::greater<Price>> bids; 
-    std::map<Price, std::list<Order>> asks;                     
+    // Core Data Structures
+    std::map<Price, std::list<Order*>, std::greater<Price>> bids; 
+    std::map<Price, std::list<Order*>> asks;                     
     
-    // Fast lookup for order cancellation (O(1))
-    // Stores a pair of (Price, iterator to the order in the list)
     struct OrderInfo {
         Price price;
         Side side;
-        std::list<Order>::iterator it;
+        std::list<Order*>::iterator it;
     };
     std::unordered_map<uint64_t, OrderInfo> orderMap;
+    
+    // Performance Components
+    ObjectPool<Order> orderPool;
+    BBO currentBBO;
+    
+    // Callbacks for Event-Driven Architecture
+    std::function<void(const TradeEvent&)> onTrade;
 
 public:
+    void setTradeCallback(std::function<void(const TradeEvent&)> cb) { onTrade = cb; }
+
     void addOrder(uint64_t id, Price price, Quantity quantity, Side side) {
-        Order order = {id, price, quantity, side};
-        
+        // Use Memory Pool to avoid heap allocation cost
+        Order* order = orderPool.allocate();
+        order->id = id;
+        order->price = price;
+        order->quantity = quantity;
+        order->side = side;
+
         if (side == Side::BUY) {
             auto& list = bids[price];
             list.push_back(order);
@@ -52,6 +105,7 @@ public:
         }
         
         matchOrders();
+        updateBBO();
     }
 
     void cancelOrder(uint64_t id) {
@@ -59,6 +113,8 @@ public:
         if (it == orderMap.end()) return;
 
         OrderInfo info = it->second;
+        Order* orderPtr = *info.it;
+
         if (info.side == Side::BUY) {
             bids[info.price].erase(info.it);
             if (bids[info.price].empty()) bids.erase(info.price);
@@ -67,8 +123,9 @@ public:
             if (asks[info.price].empty()) asks.erase(info.price);
         }
         
+        orderPool.deallocate(orderPtr); // Return to pool
         orderMap.erase(it);
-        std::cout << "Order cancelled: ID " << id << std::endl;
+        updateBBO();
     }
 
     void matchOrders() {
@@ -80,23 +137,28 @@ public:
                 auto& bestBidLevel = bestBidIt->second;
                 auto& bestAskLevel = bestAskIt->second;
 
-                Order& buyOrder = bestBidLevel.front();
-                Order& sellOrder = bestAskLevel.front();
+                Order* buyOrder = bestBidLevel.front();
+                Order* sellOrder = bestAskLevel.front();
 
-                Quantity matchQty = std::min(buyOrder.quantity, sellOrder.quantity);
+                Quantity matchQty = std::min(buyOrder->quantity, sellOrder->quantity);
                 
-                std::cout << "MATCH: " << matchQty << " units @ " << bestAskIt->first << std::endl;
+                // Trigger Trade Event
+                if (onTrade) {
+                    onTrade({buyOrder->id, sellOrder->id, bestAskIt->first, matchQty});
+                }
 
-                buyOrder.quantity -= matchQty;
-                sellOrder.quantity -= matchQty;
+                buyOrder->quantity -= matchQty;
+                sellOrder->quantity -= matchQty;
 
-                if (buyOrder.quantity == 0) {
-                    orderMap.erase(buyOrder.id);
+                if (buyOrder->quantity == 0) {
+                    orderMap.erase(buyOrder->id);
+                    orderPool.deallocate(buyOrder);
                     bestBidLevel.pop_front();
                     if (bestBidLevel.empty()) bids.erase(bestBidIt);
                 }
-                if (sellOrder.quantity == 0) {
-                    orderMap.erase(sellOrder.id);
+                if (sellOrder->quantity == 0) {
+                    orderMap.erase(sellOrder->id);
+                    orderPool.deallocate(sellOrder);
                     bestAskLevel.pop_front();
                     if (bestAskLevel.empty()) asks.erase(bestAskIt);
                 }
@@ -106,21 +168,33 @@ public:
         }
     }
 
+    void updateBBO() {
+        if (!bids.empty()) {
+            currentBBO.bestBid = bids.begin()->first;
+            currentBBO.bidQty = 0;
+            for (auto o : bids.begin()->second) currentBBO.bidQty += o->quantity;
+        } else {
+            currentBBO.bestBid = 0;
+            currentBBO.bidQty = 0;
+        }
+
+        if (!asks.empty()) {
+            currentBBO.bestAsk = asks.begin()->first;
+            currentBBO.askQty = 0;
+            for (auto o : asks.begin()->second) currentBBO.askQty += o->quantity;
+        } else {
+            currentBBO.bestAsk = 0;
+            currentBBO.askQty = 0;
+        }
+    }
+
+    BBO getBBO() const { return currentBBO; }
+
     void display() {
-        std::cout << "\n--- Order Book (Fixed-Point) ---" << std::endl;
-        std::cout << "ASKS:" << std::endl;
-        for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
-            uint32_t totalQty = 0;
-            for (auto const& o : it->second) totalQty += o.quantity;
-            std::cout << "  " << it->first << " : " << totalQty << std::endl;
-        }
-        std::cout << "BIDS:" << std::endl;
-        for (auto const& [price, orders] : bids) {
-            uint32_t totalQty = 0;
-            for (auto const& o : orders) totalQty += o.quantity;
-            std::cout << "  " << price << " : " << totalQty << std::endl;
-        }
-        std::cout << "--------------------------------\n" << std::endl;
+        std::cout << "\n--- Quantum Order Book (BBO: " 
+                  << (float)currentBBO.bestBid/SCALE << " @ " << (float)currentBBO.bestAsk/SCALE << ") ---" << std::endl;
+        std::cout << "  ASK Depth: " << asks.size() << " levels | BID Depth: " << bids.size() << " levels" << std::endl;
+        std::cout << "-----------------------------------------------------\n" << std::endl;
     }
 };
 
